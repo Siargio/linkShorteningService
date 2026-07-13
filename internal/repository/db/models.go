@@ -5,13 +5,13 @@
 package db
 
 import (
-	"github.com/jackc/pgx/v5/pgtype"
+	"time"
 )
 
 type Link struct {
-	ID        int32              `json:"id"`
-	ShortCode string             `json:"short_code"`
-	LongUrl   string             `json:"long_url"`
-	Clicks    int32              `json:"clicks"`
-	CreatedAt pgtype.Timestamptz `json:"created_at"`
+	ID        int32     `json:"id"`
+	ShortCode string    `json:"short_code"`
+	LongUrl   string    `json:"long_url"`
+	Clicks    int32     `json:"clicks"`
+	CreatedAt time.Time `json:"created_at"`
 }
