@@ -262,7 +262,7 @@ func (h *LinkHandler) Stats(
 		ShortCode: link.ShortCode,
 		LongURL:   link.LongURL,
 		Clicks:    link.Clicks,
-		CreatedAt: link.CreatedAt,
+		CreatedAt: link.CreatedAt.UTC(),
 	}
 
 	writeJSON(w, http.StatusOK, response)
@@ -354,6 +354,28 @@ func writeJSONDecodeError(
 			http.StatusBadRequest,
 			errorResponse{
 				Error: "request body must not be empty",
+			},
+		)
+
+		return
+	}
+
+	// io.ErrUnexpectedEOF означает, что JSON начался,
+	// но неожиданно закончился.
+	//
+	// Например:
+	//
+	//	{"url":"https://golang.org"
+	//
+	// В запросе отсутствует закрывающая фигурная скобка.
+	// Для json.Decoder такая ошибка не обязательно имеет тип
+	// *json.SyntaxError, поэтому проверяем её отдельно.
+	if errors.Is(err, io.ErrUnexpectedEOF) {
+		writeJSON(
+			w,
+			http.StatusBadRequest,
+			errorResponse{
+				Error: "request body contains invalid JSON",
 			},
 		)
 

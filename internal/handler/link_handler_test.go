@@ -592,6 +592,7 @@ func TestLinkHandler_Shorten_RequestBodyTooLarge(t *testing.T) {
 			longURL string,
 		) (domain.Link, error) {
 			serviceCalls++
+
 			return domain.Link{}, nil
 		},
 	}
@@ -603,12 +604,36 @@ func TestLinkHandler_Shorten_RequestBodyTooLarge(t *testing.T) {
 
 	router := NewRouter(handler)
 
-	// Создаём тело больше установленного лимита.
+	// Формируем очень длинное значение поля url.
 	//
-	// maxRequestBodySize + 1 гарантированно превышает 1 МБ.
-	largeBody := bytes.Repeat(
+	// Само значение уже имеет размер maxRequestBodySize,
+	// а с учётом JSON-обёртки полное тело гарантированно
+	// превышает допустимый лимит.
+	largeURLPart := bytes.Repeat(
 		[]byte("a"),
-		maxRequestBodySize+1,
+		maxRequestBodySize,
+	)
+
+	// Создаём корректный JSON большого размера.
+	largeBody := make(
+		[]byte,
+		0,
+		len(largeURLPart)+64,
+	)
+
+	largeBody = append(
+		largeBody,
+		[]byte(`{"url":"https://example.com/`)...,
+	)
+
+	largeBody = append(
+		largeBody,
+		largeURLPart...,
+	)
+
+	largeBody = append(
+		largeBody,
+		[]byte(`"}`)...,
 	)
 
 	request := httptest.NewRequest(
@@ -629,7 +654,8 @@ func TestLinkHandler_Shorten_RequestBodyTooLarge(t *testing.T) {
 		request,
 	)
 
-	if responseRecorder.Code != http.StatusRequestEntityTooLarge {
+	if responseRecorder.Code !=
+		http.StatusRequestEntityTooLarge {
 		t.Fatalf(
 			"expected status %d, got %d; body: %s",
 			http.StatusRequestEntityTooLarge,
@@ -638,6 +664,8 @@ func TestLinkHandler_Shorten_RequestBodyTooLarge(t *testing.T) {
 		)
 	}
 
+	// Запрос с превышенным лимитом не должен попадать
+	// в бизнес-логику.
 	if serviceCalls != 0 {
 		t.Fatalf(
 			"expected service not to be called, got %d calls",
