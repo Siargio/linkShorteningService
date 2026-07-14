@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/Siargio/linkShorteningService/internal/domain"
+	eventbus "github.com/Siargio/linkShorteningService/internal/event"
 	"github.com/Siargio/linkShorteningService/pkg/cache"
 )
 
@@ -194,6 +195,7 @@ func TestLinkService_Shorten_Success(t *testing.T) {
 	service := newLinkService(
 		repo,
 		&fakeLinkCache{},
+		&fakeEventPublisher{},
 		generator,
 		6,
 		5,
@@ -271,6 +273,7 @@ func TestLinkService_Shorten_InvalidURL(t *testing.T) {
 	service := newLinkService(
 		repo,
 		&fakeLinkCache{},
+		&fakeEventPublisher{},
 		generator,
 		6,
 		5,
@@ -365,6 +368,7 @@ func TestLinkService_Shorten_RetriesAfterCollision(t *testing.T) {
 	service := newLinkService(
 		repo,
 		&fakeLinkCache{},
+		&fakeEventPublisher{},
 		generator,
 		6,
 		5,
@@ -428,6 +432,7 @@ func TestLinkService_Shorten_AllAttemptsHaveCollisions(t *testing.T) {
 	service := newLinkService(
 		repo,
 		&fakeLinkCache{},
+		&fakeEventPublisher{},
 		generator,
 		6,
 		maxAttempts,
@@ -484,6 +489,7 @@ func TestLinkService_Shorten_GeneratorError(t *testing.T) {
 	service := newLinkService(
 		repo,
 		&fakeLinkCache{},
+		&fakeEventPublisher{},
 		generator,
 		6,
 		5,
@@ -531,6 +537,7 @@ func TestLinkService_Shorten_RepositoryError(t *testing.T) {
 	service := newLinkService(
 		repo,
 		&fakeLinkCache{},
+		&fakeEventPublisher{},
 		generator,
 		6,
 		5,
@@ -604,6 +611,7 @@ func TestLinkService_Resolve_Success(t *testing.T) {
 	service := newLinkService(
 		repo,
 		&fakeLinkCache{},
+		&fakeEventPublisher{},
 		domain.GenerateShortCode,
 		6,
 		5,
@@ -666,6 +674,7 @@ func TestLinkService_Resolve_InvalidCode(t *testing.T) {
 	service := newLinkService(
 		repo,
 		&fakeLinkCache{},
+		&fakeEventPublisher{},
 		domain.GenerateShortCode,
 		6,
 		5,
@@ -721,6 +730,7 @@ func TestLinkService_Resolve_LinkNotFound(t *testing.T) {
 	service := newLinkService(
 		repo,
 		&fakeLinkCache{},
+		&fakeEventPublisher{},
 		domain.GenerateShortCode,
 		6,
 		5,
@@ -773,6 +783,7 @@ func TestLinkService_Resolve_IncrementError(t *testing.T) {
 	service := newLinkService(
 		repo,
 		&fakeLinkCache{},
+		&fakeEventPublisher{},
 		domain.GenerateShortCode,
 		6,
 		5,
@@ -822,6 +833,7 @@ func TestLinkService_Stats_Success(t *testing.T) {
 	service := newLinkService(
 		repo,
 		&fakeLinkCache{},
+		&fakeEventPublisher{},
 		domain.GenerateShortCode,
 		6,
 		5,
@@ -877,6 +889,7 @@ func TestLinkService_Stats_InvalidCode(t *testing.T) {
 	service := newLinkService(
 		repo,
 		&fakeLinkCache{},
+		&fakeEventPublisher{},
 		domain.GenerateShortCode,
 		6,
 		5,
@@ -973,6 +986,7 @@ func TestLinkService_Resolve_CacheHit(t *testing.T) {
 	service := newLinkService(
 		repo,
 		linkCache,
+		&fakeEventPublisher{},
 		domain.GenerateShortCode,
 		6,
 		5,
@@ -1099,6 +1113,7 @@ func TestLinkService_Resolve_CacheMiss(t *testing.T) {
 	service := newLinkService(
 		repo,
 		linkCache,
+		&fakeEventPublisher{},
 		domain.GenerateShortCode,
 		6,
 		5,
@@ -1198,6 +1213,7 @@ func TestLinkService_Resolve_RedisErrorFallsBackToRepository(
 	service := newLinkService(
 		repo,
 		linkCache,
+		&fakeEventPublisher{},
 		domain.GenerateShortCode,
 		6,
 		5,
@@ -1285,6 +1301,7 @@ func TestLinkService_Resolve_CacheSetErrorDoesNotBreakRedirect(
 	service := newLinkService(
 		repo,
 		linkCache,
+		&fakeEventPublisher{},
 		domain.GenerateShortCode,
 		6,
 		5,
@@ -1308,6 +1325,117 @@ func TestLinkService_Resolve_CacheSetErrorDoesNotBreakRedirect(
 			"expected URL %q, got %q",
 			"https://golang.org",
 			longURL,
+		)
+	}
+}
+
+// fakeEventPublisher заменяет Kafka в unit-тестах.
+type fakeEventPublisher struct {
+	publishFunc func(
+		ctx context.Context,
+		linkEvent eventbus.LinkEvent,
+	) error
+}
+
+// Publish реализует event.Publisher.
+func (f *fakeEventPublisher) Publish(
+	ctx context.Context,
+	linkEvent eventbus.LinkEvent,
+) error {
+	// По умолчанию считаем публикацию успешной.
+	if f.publishFunc == nil {
+		return nil
+	}
+
+	return f.publishFunc(
+		ctx,
+		linkEvent,
+	)
+}
+
+func TestLinkService_Shorten_PublishesCreatedEvent(
+	t *testing.T,
+) {
+	publishCalls := 0
+
+	repo := &fakeLinkRepository{
+		createFunc: func(
+			ctx context.Context,
+			link domain.Link,
+		) (domain.Link, error) {
+			return domain.Link{
+				ID:        1,
+				ShortCode: link.ShortCode,
+				LongURL:   link.LongURL,
+				Clicks:    0,
+				CreatedAt: time.Now(),
+			}, nil
+		},
+	}
+
+	publisher := &fakeEventPublisher{
+		publishFunc: func(
+			ctx context.Context,
+			linkEvent eventbus.LinkEvent,
+		) error {
+			publishCalls++
+
+			if linkEvent.EventType !=
+				eventbus.LinkCreatedType {
+				t.Fatalf(
+					"expected event type %q, got %q",
+					eventbus.LinkCreatedType,
+					linkEvent.EventType,
+				)
+			}
+
+			if linkEvent.ShortCode != "abc123" {
+				t.Fatalf(
+					"expected code abc123, got %q",
+					linkEvent.ShortCode,
+				)
+			}
+
+			if linkEvent.LongURL !=
+				"https://golang.org" {
+				t.Fatalf(
+					"unexpected URL: %q",
+					linkEvent.LongURL,
+				)
+			}
+
+			return nil
+		},
+	}
+
+	generator := func(length int) (string, error) {
+		return "abc123", nil
+	}
+
+	service := newLinkService(
+		repo,
+		&fakeLinkCache{},
+		publisher,
+		generator,
+		6,
+		5,
+	)
+
+	_, err := service.Shorten(
+		context.Background(),
+		"https://golang.org",
+	)
+	if err != nil {
+		t.Fatalf(
+			"Shorten returned error: %v",
+			err,
+		)
+	}
+
+	if publishCalls != 1 {
+		t.Fatalf(
+			"expected one event, got %d",
+			publishCalls,
 		)
 	}
 }

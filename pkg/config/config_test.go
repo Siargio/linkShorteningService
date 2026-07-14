@@ -47,6 +47,16 @@ func setValidEnvironment(t *testing.T) {
 		"REDIS_TTL",
 		"24h",
 	)
+
+	t.Setenv(
+		"KAFKA_BROKERS",
+		"localhost:29092",
+	)
+
+	t.Setenv(
+		"KAFKA_TOPIC",
+		"link-events",
+	)
 }
 
 func TestLoadFromEnvironment_Success(t *testing.T) {
@@ -96,6 +106,27 @@ func TestLoadFromEnvironment_Success(t *testing.T) {
 			"expected Redis TTL %v, got %v",
 			24*time.Hour,
 			cfg.RedisTTL,
+		)
+	}
+
+	if len(cfg.KafkaBrokers) != 1 {
+		t.Fatalf(
+			"expected one Kafka broker, got %d",
+			len(cfg.KafkaBrokers),
+		)
+	}
+
+	if cfg.KafkaBrokers[0] != "localhost:29092" {
+		t.Fatalf(
+			"unexpected Kafka broker: %q",
+			cfg.KafkaBrokers[0],
+		)
+	}
+
+	if cfg.KafkaTopic != "link-events" {
+		t.Fatalf(
+			"unexpected Kafka topic: %q",
+			cfg.KafkaTopic,
 		)
 	}
 }

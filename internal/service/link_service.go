@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 
 	"github.com/Siargio/linkShorteningService/internal/domain"
+	eventbus "github.com/Siargio/linkShorteningService/internal/event"
 	"github.com/Siargio/linkShorteningService/internal/repository"
 	"github.com/Siargio/linkShorteningService/pkg/cache"
 )
@@ -69,6 +71,9 @@ type linkService struct {
 	// Если Redis недоступен, service обращается в PostgreSQL.
 	linkCache cache.LinkCache
 
+	// publisher отправляет доменные события в Kafka.
+	publisher eventbus.Publisher
+
 	// generateCode — функция генерации короткого кода.
 	//
 	// Она передаётся как зависимость для удобства тестирования.
@@ -98,10 +103,12 @@ var _ LinkService = (*linkService)(nil)
 func NewLinkService(
 	repo repository.LinkRepository,
 	linkCache cache.LinkCache,
+	publisher eventbus.Publisher,
 ) LinkService {
 	return newLinkService(
 		repo,
 		linkCache,
+		publisher,
 		domain.GenerateShortCode,
 		defaultCodeLength,
 		defaultMaxCreateAttempts,
@@ -121,13 +128,21 @@ func NewLinkService(
 func newLinkService(
 	repo repository.LinkRepository,
 	linkCache cache.LinkCache,
+	publisher eventbus.Publisher,
 	generateCode func(length int) (string, error),
 	codeLength int,
 	maxCreateAttempts int,
 ) *linkService {
+	// Если publisher не передан,
+	// используем безопасную пустую реализацию.
+	if publisher == nil {
+		publisher = eventbus.NopPublisher{}
+	}
+
 	return &linkService{
 		repo:              repo,
 		linkCache:         linkCache,
+		publisher:         publisher,
 		generateCode:      generateCode,
 		codeLength:        codeLength,
 		maxCreateAttempts: maxCreateAttempts,
@@ -189,10 +204,16 @@ func (s *linkService) Shorten(
 		// Пытаемся сохранить ссылку.
 		createdLink, err := s.repo.Create(ctx, linkToCreate)
 		if err == nil {
-			// Ссылка успешно создана.
+			// PostgreSQL успешно сохранил ссылку.
 			//
-			// createdLink уже содержит ID, Clicks и CreatedAt,
-			// возвращённые PostgreSQL.
+			// После основной операции публикуем доменное событие.
+			s.publishBestEffort(
+				ctx,
+				eventbus.NewLinkCreatedEvent(
+					createdLink,
+				),
+			)
+
 			return createdLink, nil
 		}
 
@@ -246,7 +267,7 @@ func (s *linkService) Resolve(
 	ctx context.Context,
 	code string,
 ) (string, error) {
-	// Валидируем короткий код до любых внешних запросов.
+	// Проверяем short_code до внешних запросов.
 	if err := domain.ValidateShortCode(code); err != nil {
 		return "", fmt.Errorf(
 			"validate short code: %w",
@@ -254,38 +275,31 @@ func (s *linkService) Resolve(
 		)
 	}
 
-	// Сначала ищем длинный URL в Redis.
+	var (
+		longURL      string
+		foundInCache bool
+	)
+
+	// Сначала пытаемся получить URL из Redis.
 	cachedURL, cacheErr := s.linkCache.Get(ctx, code)
 
-	// cacheErr == nil означает cache hit.
 	if cacheErr == nil {
-		// Clicks всегда обновляется в PostgreSQL,
-		// даже если URL был найден в Redis.
-		if err := s.repo.IncrementClicks(ctx, code); err != nil {
-			return "", fmt.Errorf(
-				"increment clicks for cached code %q: %w",
-				code,
-				err,
-			)
+		// Redis cache hit.
+		longURL = cachedURL
+		foundInCache = true
+	} else {
+		// Redis cache miss или техническая ошибка Redis.
+		//
+		// PostgreSQL остаётся основным источником данных.
+		link, err := s.repo.GetByCode(ctx, code)
+		if err != nil {
+			return "", fmt.Errorf("resolve link by code: %w", err)
 		}
 
-		return cachedURL, nil
+		longURL = link.LongURL
 	}
 
-	// Если произошёл cache miss или Redis недоступен,
-	// используем PostgreSQL как основной источник данных.
-	//
-	// Redis не должен быть обязательным условием
-	// успешного перехода по короткой ссылке.
-	link, err := s.repo.GetByCode(ctx, code)
-	if err != nil {
-		return "", fmt.Errorf(
-			"resolve link by code: %w",
-			err,
-		)
-	}
-
-	// Увеличиваем счётчик переходов в PostgreSQL.
+	// Счётчик переходов всегда обновляем в PostgreSQL.
 	if err := s.repo.IncrementClicks(ctx, code); err != nil {
 		return "", fmt.Errorf(
 			"increment clicks for code %q: %w",
@@ -294,17 +308,21 @@ func (s *linkService) Resolve(
 		)
 	}
 
-	// Пытаемся положить найденный URL в Redis.
+	// Если URL был получен не из Redis,
+	// пытаемся положить его в кеш.
 	//
-	// Ошибку намеренно игнорируем:
-	// ссылка всё равно может быть возвращена пользователю.
-	_ = s.linkCache.Set(
-		ctx,
-		code,
-		link.LongURL,
-	)
+	// Ошибка Redis не должна ломать redirect.
+	if !foundInCache {
+		_ = s.linkCache.Set(ctx, code, longURL)
+	}
 
-	return link.LongURL, nil
+	// Основная операция завершилась успешно:
+	// ссылка найдена, clicks увеличен.
+	//
+	// Теперь публикуем Kafka-событие.
+	s.publishBestEffort(ctx, eventbus.NewLinkVisitedEvent(code, longURL))
+
+	return longURL, nil
 }
 
 // Stats получает полную информацию о ссылке,
@@ -335,4 +353,31 @@ func (s *linkService) Stats(
 
 	// Возвращаем ссылку без изменения счётчика.
 	return link, nil
+}
+
+// publishBestEffort пытается отправить событие,
+// но не ломает основной пользовательский сценарий.
+//
+// Например, если Kafka временно недоступна:
+//   - ссылка всё равно создаётся;
+//   - redirect всё равно выполняется;
+//   - ошибка Kafka записывается в лог.
+func (s *linkService) publishBestEffort(
+	ctx context.Context,
+	linkEvent eventbus.LinkEvent,
+) {
+	if err := s.publisher.Publish(
+		ctx,
+		linkEvent,
+	); err != nil {
+		slog.Warn(
+			"failed to publish Kafka event",
+			"event_type",
+			linkEvent.EventType,
+			"short_code",
+			linkEvent.ShortCode,
+			"error",
+			err,
+		)
+	}
 }

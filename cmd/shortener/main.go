@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	eventbus "github.com/Siargio/linkShorteningService/internal/event"
 	"github.com/Siargio/linkShorteningService/internal/handler"
 	"github.com/Siargio/linkShorteningService/internal/repository"
 	"github.com/Siargio/linkShorteningService/internal/service"
@@ -47,6 +48,8 @@ const (
 	// которое даём текущим HTTP-запросам завершиться
 	// при остановке приложения.
 	shutdownTimeout = 10 * time.Second
+
+	kafkaStartupTimeout = 5 * time.Second
 )
 
 func main() {
@@ -143,6 +146,61 @@ func run(logger *slog.Logger) error {
 	}
 
 	// ------------------------------------------------------------
+	// Kafka
+	// ------------------------------------------------------------
+
+	kafkaPublisher, err :=
+		eventbus.NewKafkaPublisher(
+			cfg.KafkaBrokers,
+			cfg.KafkaTopic,
+		)
+	if err != nil {
+		return fmt.Errorf(
+			"create Kafka publisher: %w",
+			err,
+		)
+	}
+
+	// Закрываем Kafka writer при остановке приложения.
+	defer func() {
+		if closeErr := kafkaPublisher.Close(); closeErr != nil {
+			logger.Warn(
+				"failed to close Kafka publisher",
+				"error",
+				closeErr,
+			)
+		}
+	}()
+
+	kafkaContext, cancelKafkaContext :=
+		context.WithTimeout(
+			context.Background(),
+			kafkaStartupTimeout,
+		)
+
+	kafkaPingError := kafkaPublisher.Ping(kafkaContext)
+
+	cancelKafkaContext()
+
+	if kafkaPingError != nil {
+		// Kafka не является источником истины,
+		// поэтому приложение продолжает запускаться.
+		logger.Warn(
+			"Kafka is unavailable; events will not be published",
+			"error",
+			kafkaPingError,
+		)
+	} else {
+		logger.Info(
+			"Kafka connection established",
+			"brokers",
+			cfg.KafkaBrokers,
+			"topic",
+			cfg.KafkaTopic,
+		)
+	}
+
+	// ------------------------------------------------------------
 	// Dependency injection
 	// ------------------------------------------------------------
 
@@ -151,7 +209,7 @@ func run(logger *slog.Logger) error {
 
 	// Service содержит бизнес-логику
 	// и использует repository и Redis cache.
-	linkService := service.NewLinkService(linkRepository, redisCache)
+	linkService := service.NewLinkService(linkRepository, redisCache, kafkaPublisher)
 
 	// Handler преобразует HTTP-запросы
 	// в вызовы методов service.

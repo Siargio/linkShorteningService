@@ -24,6 +24,13 @@ const (
 	defaultRedisDB      = 0
 	defaultRedisTTL     = 24 * time.Hour
 
+	// При локальном запуске Go-приложение обращается
+	// к Kafka через опубликованный Docker-порт 29092.
+	defaultKafkaBrokers = "localhost:29092"
+
+	// Все события ссылок отправляем в один топик.
+	defaultKafkaTopic = "link-events"
+
 	// Номер TCP-порта должен находиться в диапазоне 1–65535.
 	minPort = 1
 	maxPort = 65535
@@ -67,6 +74,17 @@ type Config struct {
 	// Например:
 	//	24h
 	RedisTTL time.Duration
+
+	// KafkaBrokers содержит адреса Kafka broker-ов.
+	// Локально:
+	//	localhost:29092
+	//
+	// В Docker:
+	//	kafka:19092
+	KafkaBrokers []string
+
+	// KafkaTopic — топик событий ссылок.
+	KafkaTopic string
 }
 
 // Load загружает и валидирует конфигурацию.
@@ -186,6 +204,31 @@ func loadFromEnvironment() (Config, error) {
 		return Config{}, err
 	}
 
+	// Читаем список Kafka brokers.
+	// Поддерживается несколько адресов через запятую:
+	//	kafka-1:9092,kafka-2:9092,kafka-3:9092
+	kafkaBrokers, err := parseCommaSeparatedEnvironment(
+		"KAFKA_BROKERS",
+		defaultKafkaBrokers,
+	)
+	if err != nil {
+		return Config{}, err
+	}
+
+	// Имя Kafka topic.
+	kafkaTopic := strings.TrimSpace(
+		getEnvironmentOrDefault(
+			"KAFKA_TOPIC",
+			defaultKafkaTopic,
+		),
+	)
+
+	if kafkaTopic == "" {
+		return Config{}, errors.New(
+			"KAFKA_TOPIC must not be empty",
+		)
+	}
+
 	return Config{
 		HTTPPort:      httpPort,
 		BaseURL:       baseURL,
@@ -194,6 +237,8 @@ func loadFromEnvironment() (Config, error) {
 		RedisPassword: redisPassword,
 		RedisDB:       redisDB,
 		RedisTTL:      redisTTL,
+		KafkaBrokers:  kafkaBrokers,
+		KafkaTopic:    kafkaTopic,
 	}, nil
 }
 
@@ -346,4 +391,49 @@ func normalizeBaseURL(
 	}
 
 	return normalizedBaseURL, nil
+}
+
+// parseCommaSeparatedEnvironment разбирает список значений, разделённых запятыми.
+//
+// Например:
+//
+//	KAFKA_BROKERS=kafka-1:9092,kafka-2:9092
+//
+// Результат:
+//
+//	[]string{
+//	    "kafka-1:9092",
+//	    "kafka-2:9092",
+//	}
+func parseCommaSeparatedEnvironment(
+	name string,
+	defaultValue string,
+) ([]string, error) {
+	rawValue := getEnvironmentOrDefault(
+		name,
+		defaultValue,
+	)
+
+	parts := strings.Split(rawValue, ",")
+
+	values := make([]string, 0, len(parts))
+
+	for _, part := range parts {
+		value := strings.TrimSpace(part)
+
+		if value == "" {
+			continue
+		}
+
+		values = append(values, value)
+	}
+
+	if len(values) == 0 {
+		return nil, fmt.Errorf(
+			"%s must contain at least one value",
+			name,
+		)
+	}
+
+	return values, nil
 }
