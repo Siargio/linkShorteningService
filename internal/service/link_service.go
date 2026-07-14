@@ -8,6 +8,7 @@ import (
 
 	"github.com/Siargio/linkShorteningService/internal/domain"
 	"github.com/Siargio/linkShorteningService/internal/repository"
+	"github.com/Siargio/linkShorteningService/pkg/cache"
 )
 
 const (
@@ -51,26 +52,33 @@ type LinkService interface {
 //
 //	service.NewLinkService(repo)
 type linkService struct {
-	// repo — абстракция над хранилищем ссылок.
-	// Сейчас реальной реализацией является PostgreSQL repository, но service об этом не знает.
+	// repo — основное постоянное хранилище.
+	//
+	// PostgreSQL является источником истины:
+	//
+	//   - там хранится каждая ссылка;
+	//   - там хранится clicks;
+	//   - там хранится дата создания.
 	repo repository.LinkRepository
+
+	// linkCache — быстрый кеш длинных URL.
+	//
+	// Сейчас это Redis.
+	//
+	// Кеш не является источником истины.
+	// Если Redis недоступен, service обращается в PostgreSQL.
+	linkCache cache.LinkCache
 
 	// generateCode — функция генерации короткого кода.
 	//
-	// В production здесь используется domain.GenerateShortCode.
-	//
-	// Функция хранится как зависимость, чтобы в unit-тестах
-	// мы могли возвращать заранее известные коды:
-	//	abc123
-	//	x7k2mN
-	// Это делает тесты предсказуемыми.
+	// Она передаётся как зависимость для удобства тестирования.
 	generateCode func(length int) (string, error)
 
-	// codeLength — длина создаваемого короткого кода.
+	// codeLength — длина генерируемого кода.
 	codeLength int
 
 	// maxCreateAttempts — максимальное количество попыток
-	// сохранить ссылку при коллизиях short_code.
+	// при коллизиях короткого кода.
 	maxCreateAttempts int
 }
 
@@ -89,9 +97,11 @@ var _ LinkService = (*linkService)(nil)
 //   - максимум 5 попыток при коллизии.
 func NewLinkService(
 	repo repository.LinkRepository,
+	linkCache cache.LinkCache,
 ) LinkService {
 	return newLinkService(
 		repo,
+		linkCache,
 		domain.GenerateShortCode,
 		defaultCodeLength,
 		defaultMaxCreateAttempts,
@@ -110,12 +120,14 @@ func NewLinkService(
 // Тогда тест не зависит от случайных значений crypto/rand.
 func newLinkService(
 	repo repository.LinkRepository,
+	linkCache cache.LinkCache,
 	generateCode func(length int) (string, error),
 	codeLength int,
 	maxCreateAttempts int,
 ) *linkService {
 	return &linkService{
 		repo:              repo,
+		linkCache:         linkCache,
 		generateCode:      generateCode,
 		codeLength:        codeLength,
 		maxCreateAttempts: maxCreateAttempts,
@@ -219,19 +231,22 @@ func (s *linkService) Shorten(
 	)
 }
 
-// Resolve находит длинный URL по короткому коду
-// и увеличивает количество переходов.
+// Resolve получает длинный URL по короткому коду
+// и увеличивает счётчик переходов.
+//
+// Алгоритм:
+//
+//  1. Проверить короткий код.
+//  2. Попытаться получить URL из Redis.
+//  3. При cache miss обратиться в PostgreSQL.
+//  4. Сохранить найденный URL в Redis.
+//  5. Увеличить clicks в PostgreSQL.
+//  6. Вернуть длинный URL.
 func (s *linkService) Resolve(
 	ctx context.Context,
 	code string,
 ) (string, error) {
-	// Проверяем короткий код до обращения к PostgreSQL.
-	//
-	// Это позволяет не выполнять бессмысленный SQL-запрос,
-	// если код:
-	//   - пустой;
-	//   - длиннее 10 символов;
-	//   - содержит запрещённые символы.
+	// Валидируем короткий код до любых внешних запросов.
 	if err := domain.ValidateShortCode(code); err != nil {
 		return "", fmt.Errorf(
 			"validate short code: %w",
@@ -239,28 +254,38 @@ func (s *linkService) Resolve(
 		)
 	}
 
-	// Получаем ссылку из repository.
+	// Сначала ищем длинный URL в Redis.
+	cachedURL, cacheErr := s.linkCache.Get(ctx, code)
+
+	// cacheErr == nil означает cache hit.
+	if cacheErr == nil {
+		// Clicks всегда обновляется в PostgreSQL,
+		// даже если URL был найден в Redis.
+		if err := s.repo.IncrementClicks(ctx, code); err != nil {
+			return "", fmt.Errorf(
+				"increment clicks for cached code %q: %w",
+				code,
+				err,
+			)
+		}
+
+		return cachedURL, nil
+	}
+
+	// Если произошёл cache miss или Redis недоступен,
+	// используем PostgreSQL как основной источник данных.
+	//
+	// Redis не должен быть обязательным условием
+	// успешного перехода по короткой ссылке.
 	link, err := s.repo.GetByCode(ctx, code)
 	if err != nil {
-		// Ошибка domain.ErrLinkNotFound сохраняется внутри цепочки.
-		// Handler позже сможет вернуть HTTP 404.
 		return "", fmt.Errorf(
 			"resolve link by code: %w",
 			err,
 		)
 	}
 
-	// Увеличиваем счётчик только после того,
-	// как ссылка была успешно найдена.
-	//
-	// UPDATE выполняется атомарно на стороне PostgreSQL:
-	//
-	//	SET clicks = clicks + 1
-	//
-	// Это безопаснее, чем:
-	//   1. прочитать clicks;
-	//   2. увеличить его в Go;
-	//   3. записать новое значение.
+	// Увеличиваем счётчик переходов в PostgreSQL.
 	if err := s.repo.IncrementClicks(ctx, code); err != nil {
 		return "", fmt.Errorf(
 			"increment clicks for code %q: %w",
@@ -269,8 +294,16 @@ func (s *linkService) Resolve(
 		)
 	}
 
-	// Возвращаем только длинный URL.
-	// Handler использует его для HTTP redirect.
+	// Пытаемся положить найденный URL в Redis.
+	//
+	// Ошибку намеренно игнорируем:
+	// ссылка всё равно может быть возвращена пользователю.
+	_ = s.linkCache.Set(
+		ctx,
+		code,
+		link.LongURL,
+	)
+
 	return link.LongURL, nil
 }
 

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/Siargio/linkShorteningService/internal/domain"
+	"github.com/Siargio/linkShorteningService/pkg/cache"
 )
 
 // fakeLinkRepository — тестовая реализация repository.LinkRepository.
@@ -33,6 +34,59 @@ type fakeLinkRepository struct {
 		ctx context.Context,
 		code string,
 	) error
+}
+
+// fakeLinkCache — тестовая реализация cache.LinkCache.
+//
+// Она позволяет управлять поведением Redis без запуска
+// настоящего Redis-контейнера.
+type fakeLinkCache struct {
+	// getFunc определяет поведение метода Get.
+	getFunc func(
+		ctx context.Context,
+		code string,
+	) (string, error)
+
+	// setFunc определяет поведение метода Set.
+	setFunc func(
+		ctx context.Context,
+		code string,
+		longURL string,
+	) error
+}
+
+// Get реализует cache.LinkCache.
+//
+// Если конкретный тест не настроил getFunc,
+// по умолчанию считаем, что значения в кеше нет.
+//
+// Это удобно для большинства старых тестов:
+// service автоматически пойдёт в repository.
+func (f *fakeLinkCache) Get(
+	ctx context.Context,
+	code string,
+) (string, error) {
+	if f.getFunc == nil {
+		return "", cache.ErrCacheMiss
+	}
+
+	return f.getFunc(ctx, code)
+}
+
+// Set реализует cache.LinkCache.
+//
+// Если конкретный тест не настроил setFunc,
+// считаем, что запись в Redis прошла успешно.
+func (f *fakeLinkCache) Set(
+	ctx context.Context,
+	code string,
+	longURL string,
+) error {
+	if f.setFunc == nil {
+		return nil
+	}
+
+	return f.setFunc(ctx, code, longURL)
 }
 
 // Create реализует метод интерфейса repository.LinkRepository.
@@ -139,6 +193,7 @@ func TestLinkService_Shorten_Success(t *testing.T) {
 
 	service := newLinkService(
 		repo,
+		&fakeLinkCache{},
 		generator,
 		6,
 		5,
@@ -215,6 +270,7 @@ func TestLinkService_Shorten_InvalidURL(t *testing.T) {
 
 	service := newLinkService(
 		repo,
+		&fakeLinkCache{},
 		generator,
 		6,
 		5,
@@ -308,6 +364,7 @@ func TestLinkService_Shorten_RetriesAfterCollision(t *testing.T) {
 
 	service := newLinkService(
 		repo,
+		&fakeLinkCache{},
 		generator,
 		6,
 		5,
@@ -370,6 +427,7 @@ func TestLinkService_Shorten_AllAttemptsHaveCollisions(t *testing.T) {
 
 	service := newLinkService(
 		repo,
+		&fakeLinkCache{},
 		generator,
 		6,
 		maxAttempts,
@@ -425,6 +483,7 @@ func TestLinkService_Shorten_GeneratorError(t *testing.T) {
 
 	service := newLinkService(
 		repo,
+		&fakeLinkCache{},
 		generator,
 		6,
 		5,
@@ -471,6 +530,7 @@ func TestLinkService_Shorten_RepositoryError(t *testing.T) {
 
 	service := newLinkService(
 		repo,
+		&fakeLinkCache{},
 		generator,
 		6,
 		5,
@@ -543,6 +603,7 @@ func TestLinkService_Resolve_Success(t *testing.T) {
 
 	service := newLinkService(
 		repo,
+		&fakeLinkCache{},
 		domain.GenerateShortCode,
 		6,
 		5,
@@ -604,6 +665,7 @@ func TestLinkService_Resolve_InvalidCode(t *testing.T) {
 
 	service := newLinkService(
 		repo,
+		&fakeLinkCache{},
 		domain.GenerateShortCode,
 		6,
 		5,
@@ -658,6 +720,7 @@ func TestLinkService_Resolve_LinkNotFound(t *testing.T) {
 
 	service := newLinkService(
 		repo,
+		&fakeLinkCache{},
 		domain.GenerateShortCode,
 		6,
 		5,
@@ -709,6 +772,7 @@ func TestLinkService_Resolve_IncrementError(t *testing.T) {
 
 	service := newLinkService(
 		repo,
+		&fakeLinkCache{},
 		domain.GenerateShortCode,
 		6,
 		5,
@@ -757,6 +821,7 @@ func TestLinkService_Stats_Success(t *testing.T) {
 
 	service := newLinkService(
 		repo,
+		&fakeLinkCache{},
 		domain.GenerateShortCode,
 		6,
 		5,
@@ -811,6 +876,7 @@ func TestLinkService_Stats_InvalidCode(t *testing.T) {
 
 	service := newLinkService(
 		repo,
+		&fakeLinkCache{},
 		domain.GenerateShortCode,
 		6,
 		5,
@@ -832,6 +898,416 @@ func TestLinkService_Stats_InvalidCode(t *testing.T) {
 		t.Fatalf(
 			"expected GetByCode not to be called, got %d",
 			getCalls,
+		)
+	}
+}
+
+func TestLinkService_Resolve_CacheHit(t *testing.T) {
+	// Счётчики позволяют проверить,
+	// какие зависимости реально вызывались.
+	cacheGetCalls := 0
+	cacheSetCalls := 0
+	repositoryGetCalls := 0
+	incrementCalls := 0
+
+	// Имитируем Redis, в котором ссылка уже есть.
+	linkCache := &fakeLinkCache{
+		getFunc: func(
+			ctx context.Context,
+			code string,
+		) (string, error) {
+			cacheGetCalls++
+
+			if code != "abc123" {
+				t.Fatalf(
+					"expected cache code %q, got %q",
+					"abc123",
+					code,
+				)
+			}
+
+			return "https://golang.org", nil
+		},
+
+		setFunc: func(
+			ctx context.Context,
+			code string,
+			longURL string,
+		) error {
+			cacheSetCalls++
+			return nil
+		},
+	}
+
+	repo := &fakeLinkRepository{
+		getByCodeFunc: func(
+			ctx context.Context,
+			code string,
+		) (domain.Link, error) {
+			// При cache hit этот метод вызываться не должен.
+			repositoryGetCalls++
+
+			return domain.Link{}, errors.New(
+				"GetByCode must not be called on cache hit",
+			)
+		},
+
+		incrementClicksFunc: func(
+			ctx context.Context,
+			code string,
+		) error {
+			incrementCalls++
+
+			if code != "abc123" {
+				t.Fatalf(
+					"expected increment code %q, got %q",
+					"abc123",
+					code,
+				)
+			}
+
+			return nil
+		},
+	}
+
+	service := newLinkService(
+		repo,
+		linkCache,
+		domain.GenerateShortCode,
+		6,
+		5,
+	)
+
+	longURL, err := service.Resolve(
+		context.Background(),
+		"abc123",
+	)
+	if err != nil {
+		t.Fatalf("Resolve returned error: %v", err)
+	}
+
+	if longURL != "https://golang.org" {
+		t.Fatalf(
+			"expected URL %q, got %q",
+			"https://golang.org",
+			longURL,
+		)
+	}
+
+	if cacheGetCalls != 1 {
+		t.Fatalf(
+			"expected cache Get once, got %d",
+			cacheGetCalls,
+		)
+	}
+
+	// PostgreSQL не должен читать саму ссылку,
+	// поскольку URL уже получен из Redis.
+	if repositoryGetCalls != 0 {
+		t.Fatalf(
+			"expected repository GetByCode not to be called, got %d",
+			repositoryGetCalls,
+		)
+	}
+
+	// Но clicks всё равно должен обновиться в PostgreSQL.
+	if incrementCalls != 1 {
+		t.Fatalf(
+			"expected IncrementClicks once, got %d",
+			incrementCalls,
+		)
+	}
+
+	// Повторно записывать уже найденное значение не нужно.
+	if cacheSetCalls != 0 {
+		t.Fatalf(
+			"expected cache Set not to be called, got %d",
+			cacheSetCalls,
+		)
+	}
+}
+
+func TestLinkService_Resolve_CacheMiss(t *testing.T) {
+	cacheGetCalls := 0
+	cacheSetCalls := 0
+	repositoryGetCalls := 0
+	incrementCalls := 0
+
+	linkCache := &fakeLinkCache{
+		getFunc: func(
+			ctx context.Context,
+			code string,
+		) (string, error) {
+			cacheGetCalls++
+
+			// Имитируем отсутствие ключа в Redis.
+			return "", cache.ErrCacheMiss
+		},
+
+		setFunc: func(
+			ctx context.Context,
+			code string,
+			longURL string,
+		) error {
+			cacheSetCalls++
+
+			if code != "abc123" {
+				t.Fatalf(
+					"expected cache code %q, got %q",
+					"abc123",
+					code,
+				)
+			}
+
+			if longURL != "https://golang.org" {
+				t.Fatalf(
+					"expected cached URL %q, got %q",
+					"https://golang.org",
+					longURL,
+				)
+			}
+
+			return nil
+		},
+	}
+
+	repo := &fakeLinkRepository{
+		getByCodeFunc: func(
+			ctx context.Context,
+			code string,
+		) (domain.Link, error) {
+			repositoryGetCalls++
+
+			return domain.Link{
+				ID:        1,
+				ShortCode: "abc123",
+				LongURL:   "https://golang.org",
+				Clicks:    5,
+				CreatedAt: time.Now(),
+			}, nil
+		},
+
+		incrementClicksFunc: func(
+			ctx context.Context,
+			code string,
+		) error {
+			incrementCalls++
+			return nil
+		},
+	}
+
+	service := newLinkService(
+		repo,
+		linkCache,
+		domain.GenerateShortCode,
+		6,
+		5,
+	)
+
+	longURL, err := service.Resolve(
+		context.Background(),
+		"abc123",
+	)
+	if err != nil {
+		t.Fatalf("Resolve returned error: %v", err)
+	}
+
+	if longURL != "https://golang.org" {
+		t.Fatalf(
+			"expected URL %q, got %q",
+			"https://golang.org",
+			longURL,
+		)
+	}
+
+	if cacheGetCalls != 1 {
+		t.Fatalf(
+			"expected cache Get once, got %d",
+			cacheGetCalls,
+		)
+	}
+
+	// При cache miss ссылка читается из PostgreSQL.
+	if repositoryGetCalls != 1 {
+		t.Fatalf(
+			"expected repository GetByCode once, got %d",
+			repositoryGetCalls,
+		)
+	}
+
+	if incrementCalls != 1 {
+		t.Fatalf(
+			"expected IncrementClicks once, got %d",
+			incrementCalls,
+		)
+	}
+
+	// После чтения из PostgreSQL URL должен попасть в Redis.
+	if cacheSetCalls != 1 {
+		t.Fatalf(
+			"expected cache Set once, got %d",
+			cacheSetCalls,
+		)
+	}
+}
+
+func TestLinkService_Resolve_RedisErrorFallsBackToRepository(
+	t *testing.T,
+) {
+	redisError := errors.New("Redis connection refused")
+
+	repositoryGetCalls := 0
+	incrementCalls := 0
+
+	linkCache := &fakeLinkCache{
+		getFunc: func(
+			ctx context.Context,
+			code string,
+		) (string, error) {
+			// Имитируем не cache miss,
+			// а настоящую ошибку подключения к Redis.
+			return "", redisError
+		},
+	}
+
+	repo := &fakeLinkRepository{
+		getByCodeFunc: func(
+			ctx context.Context,
+			code string,
+		) (domain.Link, error) {
+			repositoryGetCalls++
+
+			return domain.Link{
+				ID:        1,
+				ShortCode: code,
+				LongURL:   "https://golang.org",
+				Clicks:    5,
+				CreatedAt: time.Now(),
+			}, nil
+		},
+
+		incrementClicksFunc: func(
+			ctx context.Context,
+			code string,
+		) error {
+			incrementCalls++
+			return nil
+		},
+	}
+
+	service := newLinkService(
+		repo,
+		linkCache,
+		domain.GenerateShortCode,
+		6,
+		5,
+	)
+
+	longURL, err := service.Resolve(
+		context.Background(),
+		"abc123",
+	)
+	if err != nil {
+		t.Fatalf(
+			"expected fallback to PostgreSQL, got error: %v",
+			err,
+		)
+	}
+
+	if longURL != "https://golang.org" {
+		t.Fatalf(
+			"expected URL %q, got %q",
+			"https://golang.org",
+			longURL,
+		)
+	}
+
+	if repositoryGetCalls != 1 {
+		t.Fatalf(
+			"expected repository fallback once, got %d",
+			repositoryGetCalls,
+		)
+	}
+
+	if incrementCalls != 1 {
+		t.Fatalf(
+			"expected IncrementClicks once, got %d",
+			incrementCalls,
+		)
+	}
+}
+
+func TestLinkService_Resolve_CacheSetErrorDoesNotBreakRedirect(
+	t *testing.T,
+) {
+	cacheSetError := errors.New("Redis SET failed")
+
+	linkCache := &fakeLinkCache{
+		getFunc: func(
+			ctx context.Context,
+			code string,
+		) (string, error) {
+			return "", cache.ErrCacheMiss
+		},
+
+		setFunc: func(
+			ctx context.Context,
+			code string,
+			longURL string,
+		) error {
+			// Имитируем ошибку сохранения в Redis.
+			return cacheSetError
+		},
+	}
+
+	repo := &fakeLinkRepository{
+		getByCodeFunc: func(
+			ctx context.Context,
+			code string,
+		) (domain.Link, error) {
+			return domain.Link{
+				ID:        1,
+				ShortCode: code,
+				LongURL:   "https://golang.org",
+				Clicks:    0,
+				CreatedAt: time.Now(),
+			}, nil
+		},
+
+		incrementClicksFunc: func(
+			ctx context.Context,
+			code string,
+		) error {
+			return nil
+		},
+	}
+
+	service := newLinkService(
+		repo,
+		linkCache,
+		domain.GenerateShortCode,
+		6,
+		5,
+	)
+
+	longURL, err := service.Resolve(
+		context.Background(),
+		"abc123",
+	)
+
+	// Ошибка Redis SET не должна стать ошибкой HTTP-перехода.
+	if err != nil {
+		t.Fatalf(
+			"expected successful redirect despite cache error, got %v",
+			err,
+		)
+	}
+
+	if longURL != "https://golang.org" {
+		t.Fatalf(
+			"expected URL %q, got %q",
+			"https://golang.org",
+			longURL,
 		)
 	}
 }
