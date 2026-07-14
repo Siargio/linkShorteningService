@@ -1,0 +1,32 @@
+# Git-репозиторий не нужен внутри Docker build context.
+.git
+.gitignore
+
+# Настройки IDE.
+.idea
+.vscode
+
+# Локальная конфигурация.
+#
+# .env не копируем в Docker-образ.
+# Docker Compose передаст нужные значения отдельно.
+.env
+
+# Результаты тестов.
+coverage.out
+coverage.html
+
+# Локальные бинарные файлы.
+bin/
+dist/
+build/
+
+# Временные файлы.
+tmp/
+temp/
+
+# Логи.
+*.log
+
+# Системные файлы macOS.
+.DS_Store

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"mime"
 	"net/http"
 	"strings"
@@ -478,6 +479,13 @@ func writeServiceError(
 	w http.ResponseWriter,
 	err error,
 ) {
+	// Клиенту не показываем технические подробности,
+	// но записываем полную ошибку в лог приложения.
+	//
+	// Благодаря оборачиванию ошибок через %w здесь будет видна
+	// вся цепочка: handler → service → repository → PostgreSQL.
+	slog.Error("request processing failed", "error", err)
+
 	switch {
 	// Некорректная длинная ссылка:
 	//

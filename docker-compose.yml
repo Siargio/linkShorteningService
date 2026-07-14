@@ -1,34 +1,187 @@
 services:
+  # ==========================================================
+  # POSTGRESQL
+  # ==========================================================
   db:
     image: postgres:16-alpine
+
     container_name: shortener-postgres
+    # Переменные, используемые PostgreSQL
+    # для первоначального создания базы.
     environment:
       POSTGRES_DB: shortener
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
+    # Публикуем PostgreSQL на localhost:5432.
+    #
+    # Это позволяет подключаться к базе:
+    #
+    #   - из Go-приложения, запущенного локально;
+    #   - из DBeaver;
+    #   - через psql на компьютере.
     ports:
       - "5433:5432"
+
+    # Данные PostgreSQL хранятся в именованном volume.
+    #
+    # Поэтому обычный docker compose down
+    # не удалит созданные ссылки.
     volumes:
       - postgres_data:/var/lib/postgresql/data
+
+    # Проверяем, что PostgreSQL уже готов принимать запросы.
+    #
+    # Простого состояния "контейнер запущен" недостаточно:
+    # процесс PostgreSQL может ещё выполнять инициализацию.
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d shortener"]
+      test: [
+        "CMD-SHELL",
+        "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"
+      ]
       interval: 5s
       timeout: 5s
-      retries: 5
+      retries: 10
+      start_period: 5s
 
+    # Автоматически перезапускаем базу после сбоя
+    # или перезапуска Docker Desktop.
+    restart: unless-stopped
+
+  # ==========================================================
+  # REDIS
+  # ==========================================================
   redis:
     image: redis:7-alpine
     container_name: shortener-redis
+
+    # Публикуем Redis на localhost:6379,
+    # чтобы он был доступен и локально запущенному приложению.
     ports:
       - "6379:6379"
+
+    # Сохраняем данные Redis в отдельном volume.
     volumes:
       - redis_data:/data
+
+    # redis-cli ping должен вернуть PONG.
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
-      timeout: 5s
-      retries: 5
+      timeout: 3s
+      retries: 10
+      start_period: 3s
 
+    restart: unless-stopped
+
+  # ==========================================================
+  # МИГРАЦИИ
+  # ==========================================================
+  migrate:
+    # Используем готовый Docker-образ golang-migrate.
+    image: migrate/migrate:v4.19.1
+
+    # Миграция должна запускаться только после того,
+    # как PostgreSQL действительно стал healthy.
+    depends_on:
+      db:
+        condition: service_healthy
+
+    # Передаём контейнеру локальную папку migrations.
+    #
+    # :ro означает read-only:
+    # контейнер может читать миграции, но не может их изменять.
+    volumes:
+      - ./migrations:/migrations:ro
+
+    # Команда эквивалентна локальному вызову:
+    #
+    # migrate \
+    #   -path migrations \
+    #   -database "postgres://..." \
+    #   up
+    #
+    # Внутри Docker-сети PostgreSQL доступен по имени сервиса db,
+    # а не через localhost.
+    command:
+       - "-path=/migrations"
+       - "-database=postgres://postgres:postgres@db:5432/shortener?sslmode=disable"
+       - "up"
+
+    # Миграция является одноразовой задачей:
+    #
+    #   - выполняет SQL;
+    #   - завершается с кодом 0;
+    #   - не должна постоянно перезапускаться.
+    restart: "no"
+
+  # ==========================================================
+  # GO-ПРИЛОЖЕНИЕ
+  # ==========================================================
+  app:
+    # Собираем приложение из Dockerfile в текущей директории.
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    # Переменные окружения приложения.
+    #
+    # Обрати внимание:
+    #
+    #   db:5432       — адрес PostgreSQL внутри Docker-сети;
+    #   redis:6379    — адрес Redis внутри Docker-сети;
+    #   localhost     — не используется для связи контейнеров.
+    environment:
+      HTTP_PORT: "8080"
+
+      # Это внешний URL, который получит пользователь.
+      #
+      # Несмотря на то что приложение находится в контейнере,
+      # пользователь открывает сервис через localhost компьютера.
+      BASE_URL: "http://localhost:8080"
+
+      DATABASE_URL: "postgres://postgres:postgres@db:5432/shortener?sslmode=disable"
+
+      REDIS_ADDR: "redis:6379"
+      REDIS_PASSWORD: ""
+      REDIS_DB: "0"
+      REDIS_TTL: "24h"
+
+      # Стандартизируем время внутри приложения.
+      TZ: "UTC"
+
+    # Публикуем порт приложения:
+    #
+    # localhost:8080 → app:8080
+    ports:
+      - "8080:8080"
+
+    # Порядок запуска.
+    depends_on:
+      # PostgreSQL должен быть полностью готов.
+      db:
+        condition: service_healthy
+
+      # Приложение стартует только после успешного
+      # завершения всех миграций.
+      migrate:
+        condition: service_completed_successfully
+
+      # Redis является необязательным кешем.
+      #
+      # Достаточно дождаться запуска контейнера.
+      # Если Redis ещё не готов или временно недоступен,
+      # приложение запустится и будет работать через PostgreSQL.
+      redis:
+        condition: service_started
+
+    restart: unless-stopped
+
+# ============================================================
+# ПОСТОЯННЫЕ ДАННЫЕ
+# ============================================================
 volumes:
+  # Данные PostgreSQL.
   postgres_data:
+
+  # Данные Redis.
   redis_data:
