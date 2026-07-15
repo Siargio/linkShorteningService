@@ -645,7 +645,3 @@ WHERE short_code = $1;
 * CI/CD;
 * OpenAPI/Swagger;
 * `/health/live` и `/health/ready`.
-
-## Автор
-
-Учебный проект сервиса сокращения ссылок на Go.
